@@ -1,0 +1,4 @@
+-keep class com.google.auto.value.extension.memoized.Memoized { *; }
+-keep class com.google.mediapipe.proto.CalculatorProfileProto$CalculatorProfile { *; }
+-keep class com.google.mediapipe.proto.GraphTemplateProto$CalculatorGraphTemplate { *; }
+-keep class com.google.mediapipe.** { *; }
