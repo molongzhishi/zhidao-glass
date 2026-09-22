@@ -54,7 +54,7 @@ flutter build apk --release
 
 > 说明：
 > - 部分原生依赖（如 sqlite3 构建产物）经 `ghproxy.net` 下载，请确保构建网络可达（见 `pubspec.yaml` 的 `hooks` 配置）。
-> - 当前 `release` 使用 debug 签名（`build.gradle.kts`），仅供测试安装；对外发布请配置正式 `key.properties`（已被 `.gitignore` 忽略）。
+> - 正式签名：`android/app/upload-keystore.jks`（密钥库）＋ `android/key.properties`（口令），两者均已被 `.gitignore` 忽略、不会进仓库；`key.properties` 缺失时自动回退 debug 签名供本地调试。**务必备份密钥库与口令**——丢失或泄露后无法再向商店发布同签名更新。
 > - Windows 上若用户目录含非 ASCII 字符（如 `C:\Users\<中文用户名>`），Gradle/NDK 可能报路径错误。可用 `subst` 将缓存目录映射到 ASCII 虚拟盘后构建：
 
 ```powershell

@@ -78,6 +78,10 @@ class VoiceAnnouncer extends ChangeNotifier {
     String text,
   ) async {
     if (priority == BroadcastPriority.ignore || text.isEmpty) return false;
+    final now = _now();
+    // 清理超出防重复窗口的旧条目，防止单内容多次出现时 Map 无界增长
+    _prune(_lastSpoken, now);
+    _prune(_lastVibrated, now);
 
     if (!_ttsReady) {
       await _ensureReady();
@@ -88,7 +92,6 @@ class VoiceAnnouncer extends ChangeNotifier {
       }
     }
 
-    final now = _now();
     final last = _lastSpoken[text];
     if (last != null && now.difference(last) < repeatInterval) {
       // 防打扰：短时间内不重复播报相同内容
@@ -97,6 +100,11 @@ class VoiceAnnouncer extends ChangeNotifier {
     _lastSpoken[text] = now;
     unawaited(_speak(priority, text));
     return true;
+  }
+
+  /// 移除时间戳早于防重复窗口的条目（超过窗口的条目对去重已无意义）
+  void _prune(Map<String, DateTime> cache, DateTime now) {
+    cache.removeWhere((_, at) => now.difference(at) >= repeatInterval);
   }
 
   Future<void> _ensureReady() async {

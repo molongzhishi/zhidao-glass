@@ -37,6 +37,15 @@ class FusionWarningService extends ChangeNotifier {
           largeItemThreshold: largeItemThreshold,
           minReportGap: minReportGap,
         ) {
+    // 节流耦合显式校验：雷达重复周期若小于播报层防重复窗口，
+    // 周期提醒会被播报层二次节流静默截断（release 模式该 assert 不生效，
+    // 需配合默认 10s 间隔使用）。
+    final b = broadcaster;
+    assert(
+      b == null || radar.repeatInterval >= b.repeatInterval,
+      '雷达重复提醒间隔(${radar.repeatInterval})应不小于播报防重复窗口'
+      '(${b?.repeatInterval})，否则会被二次节流截断',
+    );
     radar.onSpeech = _handleRadarSpeech;
     vision.onReport = _handleVisionReport;
   }

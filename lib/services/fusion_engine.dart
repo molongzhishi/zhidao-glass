@@ -164,11 +164,4 @@ class FusionEngine {
     _lastAnnouncedAt = now;
     return FusionAnnouncement(priority: priority, text: text);
   }
-
-  /// 复位内部状态（供测试/重连场景）
-  void reset() {
-    _visionItem = null;
-    _lastKey = null;
-    _lastAnnouncedAt = null;
-  }
 }

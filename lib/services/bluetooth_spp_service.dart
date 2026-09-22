@@ -44,6 +44,9 @@ class BluetoothSppService extends ChangeNotifier {
   /// 持久的事件通道监听：扫描结果与 SPP 接收数据各自独立通道
   StreamSubscription<dynamic>? _scanEventSubscription;
   StreamSubscription<dynamic>? _sppEventSubscription;
+  Timer? _sppResubscribeTimer;
+  Timer? _scanResubscribeTimer;
+  bool _disposed = false;
 
   /// SPP 原始行数据广播流，供雷达预警等业务订阅
   final StreamController<String> _sppDataController =
@@ -52,6 +55,7 @@ class BluetoothSppService extends ChangeNotifier {
   final List<ScanResult> _scanResults = [];
   final List<BluetoothDeviceItem> _classicDevices = [];
   final Map<String, String> _deviceNameCache = {};
+  static const int _maxCachedDevices = 64;
   bool _isScanning = false;
   bool _isConnected = false;
   bool _isInitialized = false;
@@ -94,22 +98,8 @@ class BluetoothSppService extends ChangeNotifier {
       }
 
       // 建立持久的事件通道监听：经典蓝牙扫描与 SPP 接收数据分别路由
-      _scanEventSubscription ??= _scanEvents
-          .receiveBroadcastStream()
-          .listen(
-            _handleScanEvent,
-            onError: (e) {
-              debugPrint('[Bluetooth] 扫描事件通道错误: $e');
-            },
-          );
-      _sppEventSubscription ??= _sppEvents
-          .receiveBroadcastStream()
-          .listen(
-            _handleSppEvent,
-            onError: (e) {
-              debugPrint('[Bluetooth] SPP 事件通道错误: $e');
-            },
-          );
+      _subscribeScanEvents();
+      _subscribeSppEvents();
 
       _isInitialized = true;
       notifyListeners();
@@ -119,6 +109,74 @@ class BluetoothSppService extends ChangeNotifier {
       notifyListeners();
       return false;
     }
+  }
+
+  /// 订阅经典蓝牙扫描事件通道；出错/完成自动重建订阅（防通道中途丢失）
+  void _subscribeScanEvents() {
+    if (_disposed) return;
+    _scanEventSubscription?.cancel();
+    _scanEventSubscription = _scanEvents
+        .receiveBroadcastStream()
+        .listen(
+          _handleScanEvent,
+          onError: (e) {
+            debugPrint('[Bluetooth] 扫描事件通道错误: $e');
+            _scheduleResubscribe(
+              () => _subscribeScanEvents(),
+              () => _scanResubscribeTimer,
+              (t) => _scanResubscribeTimer = t,
+            );
+          },
+          onDone: () {
+            debugPrint('[Bluetooth] 扫描事件通道结束，重新订阅');
+            _scheduleResubscribe(
+              () => _subscribeScanEvents(),
+              () => _scanResubscribeTimer,
+              (t) => _scanResubscribeTimer = t,
+            );
+          },
+        );
+  }
+
+  /// 订阅 SPP 数据事件通道；出错/完成自动重建订阅（防通道中途丢失）
+  void _subscribeSppEvents() {
+    if (_disposed) return;
+    _sppEventSubscription?.cancel();
+    _sppEventSubscription = _sppEvents
+        .receiveBroadcastStream()
+        .listen(
+          _handleSppEvent,
+          onError: (e) {
+            debugPrint('[Bluetooth] SPP 事件通道错误: $e');
+            _scheduleResubscribe(
+              () => _subscribeSppEvents(),
+              () => _sppResubscribeTimer,
+              (t) => _sppResubscribeTimer = t,
+            );
+          },
+          onDone: () {
+            debugPrint('[Bluetooth] SPP 事件通道结束，重新订阅');
+            _scheduleResubscribe(
+              () => _subscribeSppEvents(),
+              () => _sppResubscribeTimer,
+              (t) => _sppResubscribeTimer = t,
+            );
+          },
+        );
+  }
+
+  /// 防抖重建订阅：2s 后执行重建；期间多次错误只调度一次
+  void _scheduleResubscribe(
+    VoidCallback rebuild,
+    Timer? Function() timerGet,
+    void Function(Timer?) timerSet,
+  ) {
+    if (_disposed) return;
+    if (timerGet() != null) return;
+    timerSet(Timer(const Duration(seconds: 2), () {
+      timerSet(null);
+      rebuild();
+    }));
   }
 
   /// 处理经典蓝牙扫描事件通道：设备发现 + 扫描结束
@@ -138,6 +196,7 @@ class BluetoothSppService extends ChangeNotifier {
   /// 处理 SPP 数据事件通道：串口接收到的原始数据 + 断连通知
   void _handleSppEvent(dynamic event) {
     if (event is! Map) return;
+    if (_disposed) return;
 
     final action = event['action'] as String? ?? 'spp_data';
     if (action == 'spp_disconnected') {
@@ -148,9 +207,16 @@ class BluetoothSppService extends ChangeNotifier {
 
     final data = event['data'] as String? ?? '';
     if (data.isNotEmpty) {
-      _sppDataController.add(data);
+      _emitSppData(data);
       debugPrint('[Bluetooth] SPP 接收: ${data.trim()}');
     }
+  }
+
+  /// 广播一行 SPP 数据；防御性检查控制器未被关闭（本单例从不主动 close）
+  void _emitSppData(String data) {
+    if (_disposed) return;
+    if (_sppDataController.isClosed) return;
+    _sppDataController.add(data);
   }
 
   /// 标记 SPP 连接断开（对端关闭 / 链路异常，非用户主动断开）
@@ -171,9 +237,9 @@ class BluetoothSppService extends ChangeNotifier {
     final rssi = (event['rssi'] as num?)?.toInt() ?? -100;
 
     if (address == null || address.isEmpty) return;
-    // 缓存名称
+    // 缓存名称（带容量上限，防止长扫描期无界膨胀）
     if (name.isNotEmpty) {
-      _deviceNameCache[address] = name;
+      _cacheDeviceName(address, name);
     }
 
     // 去重
@@ -292,7 +358,7 @@ class BluetoothSppService extends ChangeNotifier {
         final address = device['address'] ?? '';
         final name = device['name'] ?? '';
         if (address.isNotEmpty && name.isNotEmpty) {
-          _deviceNameCache[address] = name;
+          _cacheDeviceName(address, name);
         }
       }
       
@@ -302,6 +368,17 @@ class BluetoothSppService extends ChangeNotifier {
       debugPrint('[Bluetooth] 获取已配对设备失败: $e');
       return [];
     }
+  }
+
+  /// 缓存设备名称，容量达到 [_maxCachedDevices] 时淘汰最早写入的条目
+  void _cacheDeviceName(String address, String name) {
+    if (name.isEmpty) return;
+    if (!_deviceNameCache.containsKey(address) &&
+        _deviceNameCache.length >= _maxCachedDevices) {
+      final oldest = _deviceNameCache.keys.first;
+      _deviceNameCache.remove(oldest);
+    }
+    _deviceNameCache[address] = name;
   }
 
   /// 从扫描结果中获取设备显示名称
@@ -469,16 +546,44 @@ class BluetoothSppService extends ChangeNotifier {
     }
   }
 
-  /// 读取已配置的 SPP 密码（未配置时返回空字符串）
+  /// 读取 SPP 密码。
+  ///
+  /// Android 上由原生侧经 Keystore 加密存储（见 MainActivity.saveSppPassword），
+  /// 明文只存在于内存中；非 Android／原生不可用（如测试）时回退 SharedPreferences。
   Future<String> getSppPassword() async {
+    try {
+      final encrypted = await _channel.invokeMethod<String>('getSppPassword');
+      if (encrypted != null) return encrypted;
+    } catch (e) {
+      debugPrint('[Bluetooth] Keystore 读取密码失败，回退本地存储: $e');
+    }
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString('spp_password') ?? '';
   }
 
-  /// 保存 SPP 连接密码，不入库、不硬编码，仅本机持久化
+  /// 保存 SPP 连接密码。
+  ///
+  /// Android 上加密落盘（Keystore），不在 SharedPreferences 明文存储，
+  /// 仅当加密写入成功后才清除历史明文键完成迁移；原生不可用时回退本地
+  /// 存储（保证测试/非 Android 环境可用）。
   Future<void> setSppPassword(String password) async {
+    final trimmed = password.trim();
+    try {
+      final ok = await _channel.invokeMethod<bool>('saveSppPassword', {
+            'password': trimmed,
+          }) ??
+          false;
+      if (ok) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove('spp_password');
+        return;
+      }
+      debugPrint('[Bluetooth] Keystore 保存密码失败，回退本地存储');
+    } catch (e) {
+      debugPrint('[Bluetooth] Keystore 保存密码失败，回退本地存储: $e');
+    }
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('spp_password', password.trim());
+    await prefs.setString('spp_password', trimmed);
   }
 
   /// 组合 connectSpp 参数（地址 + 用户配置的密码）
@@ -650,7 +755,7 @@ class BluetoothSppService extends ChangeNotifier {
       characteristic.onValueReceived.listen((data) {
         final text = String.fromCharCodes(data);
         if (text.isNotEmpty) {
-          _sppDataController.add(text);
+          _emitSppData(text);
           debugPrint('[Bluetooth] BLE 接收数据: $text');
         }
       });
@@ -704,7 +809,17 @@ class BluetoothSppService extends ChangeNotifier {
 
   @override
   void dispose() {
-    _sppDataController.close();
+    _disposed = true;
+    _sppResubscribeTimer?.cancel();
+    _sppResubscribeTimer = null;
+    _scanResubscribeTimer?.cancel();
+    _scanResubscribeTimer = null;
+    _scanEventSubscription?.cancel();
+    _scanEventSubscription = null;
+    _sppEventSubscription?.cancel();
+    _sppEventSubscription = null;
+    // 单例广播流不主动 close：否则任何迟到 add 会抛 StateError，
+    // 且生命周期内需可继续被雷达订阅（关闭后的 StreamController 无法恢复）。
     disconnect();
     super.dispose();
   }

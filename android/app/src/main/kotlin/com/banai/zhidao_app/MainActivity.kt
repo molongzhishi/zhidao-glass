@@ -10,6 +10,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Handler
 import android.os.Looper
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Base64
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -19,8 +22,13 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
+import java.security.KeyStore
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.banai.zhidao_app/bluetooth"
@@ -103,6 +111,14 @@ class MainActivity : FlutterActivity() {
                     }
                     "disconnectSpp" -> {
                         disconnectSpp(result)
+                    }
+                    "saveSppPassword" -> {
+                        val password = call.argument<String>("password") ?: ""
+                        result.success(saveSppPassword(password))
+                    }
+                    "getSppPassword" -> {
+                        // 未配置时返回空串（Dart 侧再按需回退旧明文存储）
+                        result.success(getSppPassword())
                     }
                     "isSppConnected" -> {
                         result.success(bluetoothSocket?.isConnected == true)
@@ -337,7 +353,74 @@ class MainActivity : FlutterActivity() {
         result.success(true)
     }
 
+    // ── SPP 密码安全存储（Android Keystore AES-GCM 加密）───────────
+    // 明文密码只在内存中（Dart 侧读取后传入 connectSpp）；落盘为
+    // base64(iv + ciphertext)，密钥由操作系统 Keystore 保管，不落入 SharedPreferences。
+    private val sppSecretAlias = "zhidao_spp_password_key"
+    private val securePrefsName = "zhidao_secure"
+
+    private fun saveSppPassword(password: String): Boolean {
+        return try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSppSecretKey())
+            val ct = cipher.doFinal(password.trim().toByteArray(Charsets.UTF_8))
+            val blob = cipher.iv + ct
+            getSharedPreferences(securePrefsName, Context.MODE_PRIVATE)
+                .edit()
+                .putString("spp_password", Base64.encodeToString(blob, Base64.NO_WRAP))
+                .commit()
+        } catch (e: Exception) {
+            debugLog("保存 SPP 密码失败（Keystore）: ${e.message}")
+            false
+        }
+    }
+
+    /// 读取 SPP 密码；解密失败/未配置返回空串（由 Dart 侧回退旧明文）
+    private fun getSppPassword(): String {
+        val raw = getSharedPreferences(securePrefsName, Context.MODE_PRIVATE)
+            .getString("spp_password", null) ?: return ""
+        return try {
+            val blob = Base64.decode(raw, Base64.NO_WRAP)
+            if (blob.size <= 12) return ""
+            val iv = blob.copyOfRange(0, 12)
+            val ct = blob.copyOfRange(12, blob.size)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                getOrCreateSppSecretKey(),
+                GCMParameterSpec(128, iv)
+            )
+            String(cipher.doFinal(ct), Charsets.UTF_8)
+        } catch (e: Exception) {
+            debugLog("读取 SPP 密码失败（Keystore 解密）: ${e.message}")
+            ""
+        }
+    }
+
+    /// 获取或创建 Keystore 中的 AES-256 密钥（GCM 模式）
+    private fun getOrCreateSppSecretKey(): SecretKey {
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (keyStore.getKey(sppSecretAlias, null) as? SecretKey)?.let { return it }
+        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        generator.init(
+            KeyGenParameterSpec.Builder(
+                sppSecretAlias,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
+                .build()
+        )
+        return generator.generateKey()
+    }
+
     /// 启动 SPP 输入流读取线程，逐行推送雷达数据到 Flutter
+    ///
+    /// 保持阻塞式 [BufferedReader.readLine]：EOF 与 IOException 是检测
+    /// 对端关闭/链路断链的最可靠信号（蓝牙 ACL 链路丢失会在几十秒内
+    /// 使阻塞读抛 IOException）。半开链路（链路上层存活但固件停止发送）
+    /// 无法在传输层探测，由 Dart 侧"已连接但无数据"健康检测兜底呈现。
     private fun startSppReadThread() {
         stopSppReadThread()
         if (bluetoothSocket?.isConnected != true) return
@@ -389,11 +472,14 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun stopSppReadThread() {
-        sppReadRunning.set(false)
-        sppReadThread?.interrupt()
-        sppReadThread = null
-    }
+private fun stopSppReadThread() {
+    // readLine() 不响应 interrupt：真正解除阻塞靠上层随后关闭 socket
+    // （disconnectSppInternal），届时抛 IOException 退出读取循环；
+    // 此处 interrupt 仅作标记，线程退出后置空引用。
+    sppReadRunning.set(false)
+    sppReadThread?.interrupt()
+    sppReadThread = null
+}
 
     private fun debugLog(message: String) {
         android.util.Log.d("MainActivity", message)

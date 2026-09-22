@@ -91,6 +91,11 @@ class _StatusBody extends StatelessWidget {
                 ),
               ),
             ),
+            _AlertEntry.warning(
+              visible: radar.isRadarDataMissing,
+              icon: Icons.sensors_off,
+              text: '雷达已连接但未收到数据：请检查雷达模块是否正常工作',
+            ),
             _AlertEntry.error(
               visible: !guide.cameraGranted,
               icon: Icons.videocam_off,
@@ -153,6 +158,13 @@ class _StatusBody extends StatelessWidget {
                 label: '最近触发',
                 value: _fmtRadarTrigger(radar.lastRadarTriggerAt),
                 valueColor: kGuideMuted,
+              ),
+              InfoRow(
+                label: '最近数据',
+                value: _fmtRadarTrigger(radar.lastRadarDataAt),
+                valueColor: radar.lastRadarDataAt == null
+                    ? (radar.isRadarDataMissing ? kGuideError : kGuideMuted)
+                    : kGuideMuted,
               ),
             ],
           ),

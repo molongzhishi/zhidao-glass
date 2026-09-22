@@ -54,7 +54,10 @@ class RadarSpeechIntent {
 ///    [RadarSignal]（{hasObstacle, direction}）；
 /// 2. 检测到障碍物立即触发报警（并经 [onSpeech] 交给上层触发视觉分析）；
 /// 3. 防重复：同一障碍物持续存在时，每隔 [repeatInterval] 才再次触发一次；
-/// 4. 蓝牙断连 → 标记 [isDegraded]（降级为"仅视觉"），重连后恢复。
+/// 4. 蓝牙断连 → 标记 [isDegraded]（降级为"仅视觉"），断连**不清除**
+///    最后已知障碍状态（断连 ≠ 障碍消失），重连后由下一帧雷达数据同步；
+/// 5. 数据健康检测：连接建立后 [initialDataTimeout] 内未收到任何雷达行 →
+///    [isRadarDataMissing] 置位（提示固件未启动/链路假在线）。
 ///
 /// 探测本身与视觉通道（VisionWarningService）完全解耦，互不影响；
 /// 语音播报通过 [onSpeech] 回调交给上层（融合服务）统一裁减，
@@ -66,6 +69,9 @@ class BluetoothReceiver extends ChangeNotifier {
     TtsService? ttsService,
     this.onSpeech,
     this.repeatInterval = const Duration(seconds: 10),
+    this.initialDataTimeout = const Duration(seconds: 10),
+    this.startRetryDelay = const Duration(seconds: 3),
+    this.maxStartAttempts = 5,
   })  : _bluetooth = bluetoothSpp,
         _center = warningCenter,
         _tts = ttsService;
@@ -77,8 +83,22 @@ class BluetoothReceiver extends ChangeNotifier {
   /// 语音回调。设置后本服务不再直接调用 TTS，交由上层融合服务播报。
   void Function(RadarSpeechIntent intent)? onSpeech;
 
-  /// 同一障碍物持续存在时的重复触发间隔
+  /// 同一障碍物持续存在时的重复触发间隔。
+  ///
+  /// 节流耦合：若上层接入了带防重复窗口的播报出口
+  /// （如 VoiceAnnouncer 默认 5s），本间隔必须 **≥ 播报层防重复窗口**，
+  /// 否则周期提醒会被播报层二次节流静默截断
+  /// （FusionWarningService 构造期有对应 assert 校验）。
   final Duration repeatInterval;
+
+  /// 连接建立后等待首帧雷达数据的超时；超时无数据视为雷达数据缺失
+  final Duration initialDataTimeout;
+
+  /// [start] 初始化失败后的重试间隔
+  final Duration startRetryDelay;
+
+  /// [start] 最大重试次数（超过后保持未启动，可再次手动调用 start）
+  final int maxStartAttempts;
 
   static const String obstacleAnnouncement = '前方有障碍物';
   static const String clearAnnouncement = '前方已恢复通行';
@@ -86,21 +106,40 @@ class BluetoothReceiver extends ChangeNotifier {
       '蓝牙连接已断开，无法接收雷达预警，请尽快重新连接，当前仅依靠视觉检测';
   static const String reconnectAnnouncement = '蓝牙已重新连接，雷达预警已恢复';
 
+  // 解析用正则全部静态预编译：雷达行高频到达，避免每行动态创建 RegExp 的 GC 开销
   static final _obstacleRegex = RegExp(
     r'(障碍|危险|阻挡|入侵|接近|BLOCK|DETECT|OBSTACLE)',
     caseSensitive: false,
   );
+  static final _negationRegex =
+      RegExp(r'(无障碍|无阻挡|已清除|恢复通行|安全通行|净空)');
+  static final _clearKeywordRegex = RegExp(r'(恢复|通畅|CLEAR)');
+  static final _radarClearTagRegex = RegExp(r'^(CLEAR|FREE|OK|SAFE|PASS)');
+  static final _radarObstacleTagRegex = RegExp(
+    r'^(OBSTACLE|BLOCK|DETECT|WARN|ALARM)',
+  );
+  static final _directionFrontRegex =
+      RegExp(r'(FRONT|CENTER|MIDDLE|正前|前方)');
 
   StreamSubscription<String>? _dataSub;
   Timer? _repeatTimer;
+  Timer? _startRetryTimer;
+  Timer? _healthTimer;
   bool _hasObstacle = false;
   RadarDirection _direction = RadarDirection.unknown;
   bool _degraded = false;
   bool _wasConnected = false;
   bool _sawDisconnect = false;
   bool _started = false;
+  int _startAttempts = 0;
   int _triggerCount = 0;
   DateTime? _lastTriggerAt;
+
+  // 数据健康检测状态
+  DateTime? _sessionConnectedAt;
+  DateTime? _lastDataAt;
+  bool _sawDataThisSession = false;
+  bool _dataMissingNotified = false;
 
   /// 当前是否有障碍物
   bool get hasObstacle => _hasObstacle;
@@ -117,10 +156,27 @@ class BluetoothReceiver extends ChangeNotifier {
   /// 最近一次触发的时刻
   DateTime? get lastRadarTriggerAt => _lastTriggerAt;
 
+  /// 最近一次收到雷达行数据的时刻（供状态页"最近数据"展示）
+  DateTime? get lastRadarDataAt => _lastDataAt;
+
+  /// 本次连接会话内是否收到过任何雷达行
+  bool get hasReceivedRadarData => _sawDataThisSession;
+
+  /// 雷达链路健康：已连接但超过 [initialDataTimeout] 未收到任何雷达行。
+  ///
+  /// 仅覆盖"连接后从未收到数据"（固件未启动 / 链路假在线）；
+  /// 连接中途静默无法与"雷达无事件"区分，交蓝牙链路层断链检测处理。
+  bool get isRadarDataMissing =>
+      !_degraded &&
+      _sessionConnectedAt != null &&
+      !_sawDataThisSession &&
+      DateTime.now().difference(_sessionConnectedAt!) >= initialDataTimeout;
+
+  // 与融合引擎/方位播报措辞保持一致，避免同一方位两种说法
   String get obstacleText => switch (_direction) {
-        RadarDirection.left => '前方左侧有障碍物',
-        RadarDirection.right => '前方右侧有障碍物',
-        RadarDirection.front => '前方正中有障碍物',
+        RadarDirection.left => '左侧有障碍物',
+        RadarDirection.right => '右侧有障碍物',
+        RadarDirection.front => '正前方有障碍物',
         RadarDirection.unknown => obstacleAnnouncement,
       };
 
@@ -128,64 +184,85 @@ class BluetoothReceiver extends ChangeNotifier {
   ///
   /// 支持：`RADAR:OBSTACLE [LEFT|RIGHT|FRONT]`、`RADAR:CLEAR/FREE/OK/SAFE/PASS`
   /// 及中文/英文关键词（障碍/危险/阻挡/恢复/无障碍物…）。
+  ///
+  /// **优先级（从高到低）**：
+  /// 1. `RADAR:` 协议前缀的显式标签优先于任何关键词（含否定词），
+  ///    例如 `RADAR:ALARM 净空` 仍按障碍处理（协议标签可信优先）；
+  /// 2. 无协议前缀时，否定词（无障碍/已清除…）判定恢复；
+  /// 3. 再按恢复/障碍关键词兜底。
   static RadarSignal? parse(String line) {
     final raw = line.trim();
     if (raw.isEmpty) return null;
     final upper = raw.toUpperCase();
 
-    // “无障碍物”等否定形式优先判定为恢复
-    if (RegExp(r'(无障碍|无阻挡|已清除|恢复通行|安全通行|净空)').hasMatch(raw)) {
-      if (!RegExp(r'(RADAR:(OBSTACLE|BLOCK|DETECT))').hasMatch(upper)) {
-        return const RadarSignal(hasObstacle: false);
-      }
-    }
-
-    // RADAR:<tag> 前缀优先判断
+    // 1. RADAR:<tag> 协议前缀优先
     if (upper.startsWith('RADAR:')) {
       final tag = upper.substring(6).trimLeft();
-      if (RegExp(r'^(CLEAR|FREE|OK|SAFE|PASS)').hasMatch(tag)) {
+      if (_radarClearTagRegex.hasMatch(tag)) {
         return const RadarSignal(hasObstacle: false);
       }
-      if (RegExp(r'^(OBSTACLE|BLOCK|DETECT|WARN|ALARM)').hasMatch(tag)) {
-        return RadarSignal(hasObstacle: true, direction: _parseDirection(raw));
+      if (_radarObstacleTagRegex.hasMatch(tag)) {
+        return RadarSignal(
+          hasObstacle: true,
+          direction: _parseDirection(upper),
+        );
       }
+      // 未知协议标签（如 WARMING_UP）不在此猜测，落入下方关键词兜底
     }
 
-    // 中文/英文关键词兜底
-    if (RegExp(r'(恢复|通畅|CLEAR)').hasMatch(raw)) {
+    // 2. “无障碍物”等否定形式优先判定为恢复
+    if (_negationRegex.hasMatch(raw)) {
+      return const RadarSignal(hasObstacle: false);
+    }
+
+    // 3. 中文/英文关键词兜底
+    if (_clearKeywordRegex.hasMatch(raw)) {
       if (!_obstacleRegex.hasMatch(raw)) {
         return const RadarSignal(hasObstacle: false);
       }
     }
 
     if (_obstacleRegex.hasMatch(raw)) {
-      return RadarSignal(hasObstacle: true, direction: _parseDirection(upper));
+      return RadarSignal(
+        hasObstacle: true,
+        direction: _parseDirection(upper),
+      );
     }
 
     return null;
   }
 
-  static RadarDirection _parseDirection(String upper) {
+  static RadarDirection _parseDirection(String input) {
+    // 统一大写化：RADAR: 前缀分支与关键词兜底分支传入的原始串大小写可能不同
+    final upper = input.toUpperCase();
     if (upper.contains('LEFT') || upper.contains('左')) {
       return RadarDirection.left;
     }
     if (upper.contains('RIGHT') || upper.contains('右')) {
       return RadarDirection.right;
     }
-    if (RegExp(r'(FRONT|CENTER|MIDDLE|正前|前方)').hasMatch(upper)) {
+    if (_directionFrontRegex.hasMatch(upper)) {
       return RadarDirection.front;
     }
     return RadarDirection.unknown;
   }
 
-  /// 启动雷达信号监听。可重复调用，内部幂等。
+  /// 启动雷达信号监听。初始化失败会按 [startRetryDelay] 自动重试
+  /// （最多 [maxStartAttempts] 次），失败后保持未启动、可再次手动调用。
   Future<void> start() async {
     if (_started) return;
     _started = true;
 
     try {
       // 确保事件通道已建立，供 SPP 数据与断连事件路由
-      await _bluetooth.init();
+      final ok = await _bluetooth.init();
+      if (!ok) {
+        debugPrint('[BluetoothReceiver] 蓝牙服务初始化失败，稍后自动重试');
+        _started = false;
+        _scheduleStartRetry();
+        return;
+      }
+      _startAttempts = 0;
 
       _dataSub = _bluetooth.sppDataStream.listen(
         _handleLine,
@@ -193,12 +270,31 @@ class BluetoothReceiver extends ChangeNotifier {
       );
       _bluetooth.addListener(_onBluetoothStateChanged);
       _wasConnected = _bluetooth.isConnected;
+      if (_wasConnected) _sessionConnectedAt ??= DateTime.now();
     } catch (e) {
       debugPrint('[BluetoothReceiver] 雷达信号通道启动失败: $e');
+      _started = false;
+      _scheduleStartRetry();
     }
   }
 
+  void _scheduleStartRetry() {
+    if (_startAttempts >= maxStartAttempts) {
+      debugPrint('[BluetoothReceiver] 启动重试已达上限，保持未启动待手动触发');
+      return;
+    }
+    _startRetryTimer?.cancel();
+    _startRetryTimer = Timer(startRetryDelay, () {
+      _startRetryTimer = null;
+      _startAttempts++;
+      unawaited(start());
+    });
+  }
+
   void _handleLine(String line) {
+    // 先记录数据时间戳：证明链路有数据（含降级期间，用于健康统计）
+    _markDataReceived();
+
     // 断连降级后忽略雷达数据，仅剩视觉通道
     if (_degraded) return;
     final signal = parse(line);
@@ -207,6 +303,16 @@ class BluetoothReceiver extends ChangeNotifier {
       _onObstacle(signal.direction);
     } else {
       _onClear();
+    }
+  }
+
+  void _markDataReceived() {
+    _lastDataAt = DateTime.now();
+    if (_sawDataThisSession) return;
+    _sawDataThisSession = true;
+    if (_dataMissingNotified) {
+      _dataMissingNotified = false;
+      notifyListeners();
     }
   }
 
@@ -227,13 +333,7 @@ class BluetoothReceiver extends ChangeNotifier {
       _triggerCount++;
       _lastTriggerAt = DateTime.now();
       _emitSpeech(obstacleText, RadarSpeechKind.obstacle);
-      _stopRepeatTimer();
-      _repeatTimer = Timer.periodic(repeatInterval, (_) {
-        if (_hasObstacle && !_degraded) {
-          debugPrint('[BluetoothReceiver] 周期触发障碍物提醒');
-          _emitSpeech(obstacleText, RadarSpeechKind.obstacle);
-        }
-      });
+      _startRepeatReminder();
     }
   }
 
@@ -258,21 +358,59 @@ class BluetoothReceiver extends ChangeNotifier {
 
     if (connected) {
       _degraded = false;
+      // 新一轮会话数据健康检测：等待本会话首帧雷达数据
+      _sessionConnectedAt = DateTime.now();
+      _sawDataThisSession = false;
+      _dataMissingNotified = false;
+      _startHealthMonitor();
       notifyListeners();
       if (_sawDisconnect) {
         _emitSpeech(reconnectAnnouncement, RadarSpeechKind.reconnected);
       }
       _sawDisconnect = false;
+      // 断连前若仍有障碍（保留的最后已知状态），重连后恢复周期提醒，
+      // 由随后到达的雷达帧（或 RADAR:CLEAR）同步真实状态。
+      if (_hasObstacle) {
+        _startRepeatReminder();
+      }
     } else {
       _sawDisconnect = true;
       _degraded = true;
-      _hasObstacle = false;
-      _direction = RadarDirection.unknown;
+      // 断连 ≠ 障碍清除：保留最后已知障碍状态，仅停止周期提醒与健康监控；
+      // UI 以降级横幅提示雷达不可用，避免用户误以为障碍已消失。
       _stopRepeatTimer();
-      _center.setRadarObstacle(false);
+      _stopHealthMonitor();
       notifyListeners();
       _emitSpeech(disconnectAnnouncement, RadarSpeechKind.disconnected);
     }
+  }
+
+  /// 障碍持续期周期性重复提醒（防重复节流见 [repeatInterval] 注释）
+  void _startRepeatReminder() {
+    _stopRepeatTimer();
+    _repeatTimer = Timer.periodic(repeatInterval, (_) {
+      if (_hasObstacle && !_degraded) {
+        debugPrint('[BluetoothReceiver] 周期触发障碍物提醒');
+        _emitSpeech(obstacleText, RadarSpeechKind.obstacle);
+      }
+    });
+  }
+
+  /// 周期检查雷达数据健康状态，仅在状态翻转时通知 UI
+  void _startHealthMonitor() {
+    _stopHealthMonitor();
+    _healthTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final missing = isRadarDataMissing;
+      if (missing != _dataMissingNotified) {
+        _dataMissingNotified = missing;
+        notifyListeners();
+      }
+    });
+  }
+
+  void _stopHealthMonitor() {
+    _healthTimer?.cancel();
+    _healthTimer = null;
   }
 
   void _stopRepeatTimer() {
@@ -305,6 +443,9 @@ class BluetoothReceiver extends ChangeNotifier {
     _dataSub?.cancel();
     _bluetooth.removeListener(_onBluetoothStateChanged);
     _stopRepeatTimer();
+    _stopHealthMonitor();
+    _startRetryTimer?.cancel();
+    _startRetryTimer = null;
     super.dispose();
   }
 }
